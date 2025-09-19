@@ -1,0 +1,169 @@
+name: Dependency Security Audit
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 2 * * 1'  # Weekly on Monday at 2 AM
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  unified-security-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
+      issues: write
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18.x'
+
+    - name: Install Python security tools
+      run: |
+        python -m pip install --upgrade pip
+        pip install safety pip-audit
+
+    - name: Install Node.js dependencies (if package.json exists)
+      run: |
+        if [ -f "frontend/package.json" ]; then
+          cd frontend
+          npm ci
+        fi
+
+    - name: Install Docker security tools
+      run: |
+        # Install Trivy
+        sudo apt-get update
+        sudo apt-get install wget apt-transport-https gnupg lsb-release
+        wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+        echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+        sudo apt-get update
+        sudo apt-get install trivy
+
+    - name: Run Python security scan
+      run: |
+        cd dependency-audit
+        python pypi_scanner.py --path .. --output ../python-audit-results.json --verbose
+      continue-on-error: true
+
+    - name: Run NPM security scan
+      run: |
+        if [ -f "frontend/package.json" ]; then
+          cd dependency-audit
+          python npm_scanner.py --path ../frontend --output ../npm-audit-results.json --verbose
+        fi
+      continue-on-error: true
+
+    - name: Run Docker security scan
+      run: |
+        cd dependency-audit
+        python docker_scanner.py --path .. --output ../docker-audit-results.json --verbose
+      continue-on-error: true
+
+    - name: Run unified security scan
+      run: |
+        cd dependency-audit
+        python unified_scanner.py --path .. --format json --output ../unified-audit-results.json --verbose
+
+    - name: Upload security scan results
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-audit-results
+        path: |
+          *-audit-results.json
+
+    - name: Parse scan results and create issue
+      if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+      uses: actions/github-script@v7
+      with:
+        script: |
+          const fs = require('fs');
+          
+          // Read unified scan results
+          let scanResults = {};
+          try {
+            const resultsData = fs.readFileSync('unified-audit-results.json', 'utf8');
+            scanResults = JSON.parse(resultsData);
+          } catch (error) {
+            console.log('Could not read scan results:', error.message);
+            return;
+          }
+          
+          const totalVulns = scanResults.total_vulnerabilities || 0;
+          
+          if (totalVulns === 0) {
+            console.log('No vulnerabilities found, skipping issue creation');
+            return;
+          }
+          
+          // Create issue title and body
+          const title = `Security vulnerabilities found: ${totalVulns} issues`;
+          const scanTime = new Date(scanResults.scan_time).toLocaleString();
+          
+          let body = `## Security Vulnerability Report\n\n`;
+          body += `**Scan Time:** ${scanTime}\n`;
+          body += `**Total Vulnerabilities:** ${totalVulns}\n\n`;
+          
+          // Add summary
+          if (scanResults.summary && scanResults.summary.total) {
+            body += `### Summary by Severity\n`;
+            const summary = scanResults.summary.total;
+            if (summary.critical > 0) body += `- **Critical**: ${summary.critical}\n`;
+            if (summary.high > 0) body += `- **High**: ${summary.high}\n`;
+            if (summary.moderate > 0) body += `- **Moderate**: ${summary.moderate}\n`;
+            if (summary.low > 0) body += `- **Low**: ${summary.low}\n`;
+            body += `\n`;
+          }
+          
+          body += `### Scan Details\n`;
+          body += `This automated security scan found vulnerabilities in the project dependencies.\n\n`;
+          body += `**Scanned Components:**\n`;
+          body += `- NPM packages (frontend)\n`;
+          body += `- Python packages (backend)\n`;
+          body += `- Docker configuration\n\n`;
+          body += `Please review the uploaded artifacts for detailed information about each vulnerability.\n\n`;
+          body += `---\n`;
+          body += `*This issue was created automatically by the security audit workflow.*`;
+          
+          // Create issue
+          const { data: issue } = await github.rest.issues.create({
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            title: title,
+            body: body,
+            labels: ['security', 'vulnerability', 'automated']
+          });
+          
+          console.log(`Created issue #${issue.number}: ${issue.html_url}`);
+
+    - name: Fail job if critical vulnerabilities found
+      run: |
+        if [ -f "unified-audit-results.json" ]; then
+          critical_count=$(python -c "
+import json
+try:
+    with open('unified-audit-results.json') as f:
+        data = json.load(f)
+        print(data.get('summary', {}).get('total', {}).get('critical', 0))
+except:
+    print(0)
+")
+          echo "Critical vulnerabilities found: $critical_count"
+          if [ "$critical_count" -gt 0 ]; then
+            echo "❌ Critical vulnerabilities found! Please review and fix before merging."
+            exit 1
+          fi
+        fi
