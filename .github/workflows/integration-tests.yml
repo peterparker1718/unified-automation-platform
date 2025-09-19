@@ -1,0 +1,185 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  integration-tests:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18.x'
+
+    - name: Install backend dependencies
+      run: |
+        cd backend
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio httpx
+
+    - name: Install frontend dependencies
+      run: |
+        cd frontend
+        npm ci
+
+    - name: Start backend server
+      run: |
+        cd backend
+        # Create test environment file
+        echo "OPENAI_API_KEY=test_key" > .env
+        echo "GITHUB_TOKEN=test_token" >> .env
+        echo "DATABASE_URL=postgresql://postgres:postgres@localhost:5432/test_db" >> .env
+        
+        # Start server in background
+        python -m uvicorn server:app --host 0.0.0.0 --port 8000 &
+        sleep 10
+      env:
+        PYTHONPATH: ${{ github.workspace }}/backend
+
+    - name: Health check backend
+      run: |
+        curl -f http://localhost:8000/health || exit 1
+
+    - name: Build frontend
+      run: |
+        cd frontend
+        npm run build
+
+    - name: Start frontend server
+      run: |
+        cd frontend
+        npm install -g serve
+        serve -s build -l 3000 &
+        sleep 10
+
+    - name: Health check frontend
+      run: |
+        curl -f http://localhost:3000/ || exit 1
+
+    - name: Run backend integration tests
+      run: |
+        cd backend
+        # Create integration tests if they don't exist
+        mkdir -p tests/integration
+        cat > tests/integration/test_api.py << 'EOF'
+import pytest
+import httpx
+import asyncio
+
+BASE_URL = "http://localhost:8000"
+
+@pytest.mark.asyncio
+async def test_health_endpoint():
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{BASE_URL}/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "healthy"
+
+@pytest.mark.asyncio
+async def test_config_endpoint():
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{BASE_URL}/api/config")
+        assert response.status_code == 200
+        data = response.json()
+        assert "config" in data
+
+@pytest.mark.asyncio
+async def test_tasks_list():
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"{BASE_URL}/api/tasks")
+        assert response.status_code == 200
+        data = response.json()
+        assert "tasks" in data
+EOF
+        
+        pytest tests/integration/ -v
+
+    - name: Run frontend integration tests
+      run: |
+        cd frontend
+        # Create basic integration test
+        cat > src/integration.test.js << 'EOF'
+describe('Frontend Integration Tests', () => {
+  test('frontend is accessible', async () => {
+    const response = await fetch('http://localhost:3000/');
+    expect(response.status).toBe(200);
+  });
+
+  test('backend API is accessible', async () => {
+    const response = await fetch('http://localhost:8000/health');
+    expect(response.status).toBe(200);
+    const data = await response.json();
+    expect(data.status).toBe('healthy');
+  });
+});
+EOF
+        
+        npm test -- --testPathPattern=integration.test.js --watchAll=false
+
+    - name: Test end-to-end workflow
+      run: |
+        # Test basic API workflow
+        echo "Testing complete workflow..."
+        
+        # Test task creation
+        TASK_RESPONSE=$(curl -s -X POST http://localhost:8000/api/tasks \
+          -H "Content-Type: application/json" \
+          -d '{
+            "name": "Integration Test Task",
+            "description": "Test task for integration testing",
+            "task_type": "code_generation",
+            "parameters": {
+              "prompt": "Create a hello world function",
+              "language": "python"
+            }
+          }')
+        
+        echo "Task creation response: $TASK_RESPONSE"
+        
+        # Extract task ID (basic parsing)
+        TASK_ID=$(echo $TASK_RESPONSE | grep -o '"task_id":"[^"]*"' | cut -d'"' -f4)
+        echo "Created task ID: $TASK_ID"
+        
+        if [ -n "$TASK_ID" ]; then
+          # Check task status
+          sleep 2
+          TASK_STATUS=$(curl -s http://localhost:8000/api/tasks/$TASK_ID)
+          echo "Task status: $TASK_STATUS"
+        fi
+
+    - name: Collect logs
+      if: failure()
+      run: |
+        echo "=== Backend logs ==="
+        # Backend logs would be captured here
+        
+        echo "=== Frontend logs ==="
+        # Frontend logs would be captured here
